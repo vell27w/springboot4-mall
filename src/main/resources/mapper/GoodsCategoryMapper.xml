@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<!--
+  namespace 必须等于 Mapper 接口的全限定名，改包名时这里容易漏改，
+  漏了就是 "Invalid bound statement (not found)"。
+-->
+<mapper namespace="com.vell27w.mall.mapper.GoodsCategoryMapper">
+
+    <!--
+      ⚠️ 这里 SELECT 了 is_deleted 和 category_rank，
+      虽然 CategoryVO 里【故意不返回】它们 —— 因为这一层查的是 entity，
+      不是要直接吐给前端的 VO。凡是「内部要用、外部不该看」的字段，
+      都要靠 VO 去挡，而不是靠 SQL 不查（SQL 不查就没法用来拼树了）。
+    -->
+    <sql id="baseColumns">
+        id, category_level, parent_id, category_name, category_rank,
+        is_deleted, create_time, update_time
+    </sql>
+
+    <!--
+      查全部分类，一次查完，不在数据库里做递归。
+
+      ============================================================
+      【WHERE is_deleted = 0 这一句漏了会怎样？】
+      ============================================================
+      被逻辑删除的分类会重新出现在分类树里。
+      这个 bug 有个特点：只有「删过分类之后」才看得见，
+      刚建完库、数据干净的时候怎么测都是对的。
+      所以看到这张表的查询，第一件事就是确认有没有这个条件。
+
+      ============================================================
+      【ORDER BY 为什么这么写】
+      ============================================================
+      category_level ASC  —— 先按层级排。这样父节点一定排在子节点前面，
+                            拼树时能一趟扫完（虽然本项目用的是「先归组再挂」
+                            的做法，不依赖这个顺序，但保序更稳）。
+      category_rank DESC —— 同一层内，rank 大的靠前（这是这张表的约定）。
+      id ASC             —— 兜底。rank 相同时按 id 排，保证顺序【稳定】。
+
+      ⚠️ 最后那个 id ASC 不是可有可无的：
+      排序不稳定的后果，和分页查询不带 ORDER BY 是一样的 ——
+      两个分类 rank 都是 0 时，MySQL 每次返回的先后顺序可能不一样，
+      前端看到的就是「刷新一下侧边栏顺序就变了」。
+      这类 bug 极难复现，因为它依赖存储引擎的返回顺序，而那是没保证的。
+    -->
+    <select id="findAllForTree" resultType="com.vell27w.mall.entity.GoodsCategory">
+        SELECT <include refid="baseColumns"/>
+        FROM goods_category
+        WHERE is_deleted = 0
+        ORDER BY category_level ASC, category_rank DESC, id ASC
+    </select>
+
+</mapper>

@@ -1,0 +1,206 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="com.vell27w.mall.mapper.GoodsInfoMapper">
+
+    <!--
+      ============================================================
+      【列表接口查哪些列 —— 这一段就是「列表接口优化」的答案】
+      ============================================================
+      和 GoodsListVO 的字段严格一一对应，一个不多一个不少。
+
+      ⚠️ 特别注意【没有】的那几列，每一列省下来都是有理由的：
+
+        goods_detail_content —— 商品详情富文本，TEXT 类型。
+                                一页 10 条就是 10 份富文本，响应体能涨到几百 KB，
+                                而列表页【一个字都不显示它】。
+                                这是本接口最大的一笔开销，也是最容易忘的一笔。
+
+        stock_num            —— 列表页不显示库存
+        category_id          —— 调用方已经在某个分类里了，不必再告诉它
+        goods_sell_status    —— 列表只查上架的，恒等于 0
+        create_time / update_time —— 内部字段
+
+      【判断一列该不该查的通用问法】
+        「这个接口的响应里会用到它吗？」答不上来就去掉。
+        少查一列就少一次磁盘读、少一段网络传输 —— 这是不花钱的优化。
+    -->
+    <sql id="listColumns">
+        id, goods_name, goods_intro, cover_img, original_price, selling_price, tag
+    </sql>
+
+    <!--
+      ============================================================
+      【列表和统计共用的筛选条件】
+      ============================================================
+      抽成片段的原因：findPage 和 countByCondition 的条件必须【一模一样】。
+      写两份的话，改了其中一个忘了另一个，就会出现
+      「列表 3 条、总页数说 10 页」—— 前端翻到第 4 页是空的。
+
+      ── 第一行 goods_sell_status = 0 ─────────────────────────────
+      ⚠️⚠️ 这个 0 是【已上架】的意思，不是 1。这张表的约定是反的
+      （0-上架 1-下架，从参考项目沿用）。写成 = 1 的话接口不报错，
+      只是返回的全是已下架商品 —— 这类「不报错但结果错」的 bug 最难查。
+      所以这里是写死的常量，不给调用方传的机会。
+
+      ── <where> 标签 ─────────────────────────────────────────────
+      它会自动去掉开头多余的 AND，条件全为空时也不会留下孤零零一个 WHERE。
+      手写 "WHERE 1=1" 也能达到同样效果，但那是老写法。
+
+      ── 关键字 ───────────────────────────────────────────────────
+      LIKE CONCAT('%', #{keyword}, '%')：注意是【#{} 不是 ${}】。
+      #{} 编译成预编译语句的 ?，用户输入只是「一个值」，不可能改变 SQL 结构 ——
+      这是防 SQL 注入的根本手段。
+      ⚠️ 顺便说一个参考项目里的真 bug：它把这行写成
+          CONCAT('%','#{goodsName}','%')
+      给 #{} 套了单引号，于是 "?" 变成了字面量字符串 "%#{goodsName}%"，
+      搜索结果【永远为空】。单引号一加，#{} 就不再是占位符了。
+
+      ── 关键字为什么用不了索引 ───────────────────────────────────
+      '%x%' 前面带百分号，B+Tree 是按前缀有序的，不知道从哪个前缀开始，
+      只能全表扫。这是面试高频题，答案就在这里。
+    -->
+    <sql id="queryCondition">
+        <where>
+            AND goods_sell_status = 0
+            <if test="query.categoryId != null">
+                AND category_id = #{query.categoryId}
+            </if>
+            <if test="query.keyword != null and query.keyword != ''">
+                AND goods_name LIKE CONCAT('%', #{query.keyword}, '%')
+            </if>
+        </where>
+    </sql>
+
+    <!--
+      ============================================================
+      【这个接口和那个组合索引的关系 —— 本项目的核心】
+      ============================================================
+      最终拼出来的 SQL 形态是：
+
+          WHERE goods_sell_status = 0 [AND category_id = ?] [AND goods_name LIKE ?]
+          ORDER BY ...
+          LIMIT ?, ?
+
+      对应 schema.sql 里建的索引：
+          idx_category_status_price (category_id, goods_sell_status, selling_price)
+
+      【带分类时】等值条件命中索引前两列，排序列正好是第三列 →
+                  可以直接顺着索引取，不用额外排序。
+                  实测 EXPLAIN 的 Extra 里出现的是 Backward index scan（降序时），
+                  【没有 filesort】。
+
+      【不带分类时】⚠️ 这里有个必须知道的后果：
+                  条件里只剩 goods_sell_status，跳过了索引的最左列 category_id，
+                  不满足「最左前缀」，于是【整个索引都用不上】，
+                  排序只能自己来（EXPLAIN 里出现 Using filesort）。
+
+                  这不是写错了，是索引本身的规则。
+                  工程上的处理方式二选一：
+                    ① 产品上要求「列表必须带分类」（本项目演示用，就这样）
+                    ② 再补一个 (goods_sell_status, selling_price) 索引专门服务全站列表
+                  面试答到这一层，比只说「建了索引」要深得多。
+      ============================================================
+    -->
+    <select id="findPage" resultType="com.vell27w.mall.vo.GoodsListVO">
+        SELECT <include refid="listColumns"/>
+        FROM goods_info
+        <include refid="queryCondition"/>
+
+        <!--
+          ============================================================
+          【排序：为什么是 <choose> 而不是 ORDER BY ${query.sort}】
+          ============================================================
+          MySQL 的 ORDER BY 后面【不能用 #{} 占位符】—— #{} 编译出来是 ?，
+          而 ? 只能代表「一个值」，代表不了「一个列名」。
+          所以想动态指定排序列，唯一的办法是拼字符串：
+
+              ORDER BY ${query.sort}     ⛔ 千万别这么写
+
+          一拼就是 SQL 注入（完整的攻击串写在 GoodsQueryParam.sort 的注释里，
+          那里不受 XML 注释的转义限制）：
+          用户在 sort 里塞进一段「先结束当前语句、再执行别的语句」的内容，
+          拼出来就是一条合法 SQL。而且它排在语句最后，收尾特别容易。
+
+          ※ 顺带记一个踩过的坑：XML 注释里【不能出现连续两个减号】，
+            这是 XML 规范的规定，出现就整个文件解析失败。
+            而 SQL 的注释符恰好就是那两个减号 ——
+            所以想在 XML 注释里举例 SQL 注入，得换个说法。
+
+          【正确做法】不拼用户输入，而是【在白名单里选】：
+          下面每一段 ORDER BY 都是【写死的】字符串，用户传的值只用来做比较。
+          命中哪个用哪个，没命中就落到 <otherwise>。
+
+          好处：错误值不会报错、不会 500，而是静默回落到默认排序 ——
+          对公开接口来说比抛异常更合适。
+
+          ── 每个 ORDER BY 末尾都跟了个 id DESC ────────────────────
+          和分类那个查询里的 id ASC 是同一个理由：保证排序【稳定】。
+          只按售价排的话，两款价格相同的商品谁先谁后是没保证的，
+          分页时就会出现「同一个商品在第 1 页和第 2 页各出现一次」——
+          这叫分页数据漂移。加 id 兜底就定死了。
+
+          ── ⚠️ OGNL 的一个坑，顺便记一下 ──────────────────────────
+          这里的 'price_asc' 是【多字符】，OGNL 会当成 String 比较，没问题。
+          但如果是【单字符】比如 'A'，OGNL 会把单引号里的内容当成 Character，
+          拿 String 去和 Character 比，永远是 false —— 而且不报错，
+          只是条件静默失效。所以遇到单字符的判断，要写成
+          test='"A".equals(query.status)' 这种形式。这是 MyBatis 经典坑。
+        -->
+        <choose>
+            <when test="query.sort == 'price_asc'">
+                ORDER BY selling_price ASC, id DESC
+            </when>
+            <when test="query.sort == 'price_desc'">
+                ORDER BY selling_price DESC, id DESC
+            </when>
+            <otherwise>
+                ORDER BY id DESC
+            </otherwise>
+        </choose>
+
+        <!--
+          #{query.offset} 会调用 GoodsQueryParam.getOffset()，
+          页码从 1 开始、偏移量从 0 开始的换算写在那个方法里，
+          SQL 这边不用管。
+          pageSize 的上限（100）也是 PageQuery 的 setter 里卡住的。
+        -->
+        LIMIT #{query.offset}, #{query.pageSize}
+    </select>
+
+    <!--
+      统计总数。条件和 findPage 【共用同一个片段】，
+      所以「有没有只算上架商品」这类问题不会出现两边不一致。
+      排序和分页对 COUNT 没意义，所以不 include 它们。
+    -->
+    <select id="countByCondition" resultType="long">
+        SELECT COUNT(*)
+        FROM goods_info
+        <include refid="queryCondition"/>
+    </select>
+
+    <!--
+      商品详情。这里【单独列字段】，不复用 listColumns ——
+      因为它要的恰恰是列表不要的那些：详情富文本、库存、分类 id。
+
+      ⚠️ AND goods_sell_status = 0 是【接口安全的一部分】：
+      已下架商品必须查不出来，service 层拿到 null 就统一返回 404。
+      忘加这一句，已下架商品就能被直接访问到，而测试时很难发现 ——
+      因为手边拿来调的 id 多半是个上架商品。
+
+      ⚠️ 这里【不做 JOIN】拿分类名，是故意的。
+      理由见 GoodsDetailVO 的类注释：以后要给这个接口加缓存，
+      缓存对象就是 GoodsDetailVO 这个整体，两张表拼出来的东西会让
+      「分类改名了缓存怎么办」变成一个额外的一致性问题。
+      而且分类树前端已经全量拿过一次，自己就能查出名字。
+    -->
+    <select id="findOnSaleById" resultType="com.vell27w.mall.vo.GoodsDetailVO">
+        SELECT id, goods_name, goods_intro, category_id, cover_img,
+               goods_detail_content, original_price, selling_price, stock_num, tag
+        FROM goods_info
+        WHERE id = #{id}
+          AND goods_sell_status = 0
+    </select>
+
+</mapper>

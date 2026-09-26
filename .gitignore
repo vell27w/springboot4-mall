@@ -1,0 +1,53 @@
+HELP.md
+target/
+.mvn/wrapper/maven-wrapper.jar
+!**/src/main/**/target/
+!**/src/test/**/target/
+
+### STS ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+
+### IntelliJ IDEA ###
+.idea
+*.iws
+*.iml
+*.ipr
+
+### NetBeans ###
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+build/
+!**/src/main/**/build/
+!**/src/test/**/build/
+
+### VS Code ###
+.vscode/
+
+### Claude Code worktrees ###
+# 这里放的是 worktree 的内部指针文件（gitfile，内容只有一行 "gitdir: ..."），
+# 不是项目内容。2026-09-22 被误提交过一次，加这条防止再犯。
+.claude/worktrees/
+
+### Claude Code 本地设置 ###
+# 权限白名单之类的本机设置，跟项目无关，每个人不一样。
+.claude/settings.local.json
+
+### 只留本地的文档（不跟着代码公开）###
+# docs/ 整个目录都是「写给我自己看」的东西：
+#   进度.md        开发日志（做到哪 / 踩过的坑 / 实测记录）
+#   docker-*.md    Docker 手册
+#   规划/检验/资料.md  求职准备笔记
+#   fix-winget-path.ps1  修本机 winget PATH 的脚本，跟本项目无关
+# 文件都还在磁盘上、照常能看，只是不提交。
+docs/
+# 给 Claude Code 看的项目说明（索引指向上面这些本地文档）
+CLAUDE.md

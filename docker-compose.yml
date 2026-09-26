@@ -1,0 +1,154 @@
+# ============================================================
+#  开发环境的三个中间件 —— MySQL / Redis / RabbitMQ
+# ============================================================
+#  起：docker compose up -d
+#  停：docker compose down          （数据留着）
+#  毁：docker compose down -v       （连数据卷一起删，**数据全没**）
+#  看：docker compose ps / docker compose logs -f
+#
+#  ⚠️ 国内网络必须先配镜像加速器，否则拉不下来镜像。
+#     症状：docker compose up 卡在 pull，最后报 DNS 或超时。
+#     配法：Docker Desktop → Settings → Docker Engine，在 JSON 里加一段
+#         "registry-mirrors": ["https://docker.m.daocloud.io", "https://docker.1ms.run"]
+#     然后 Apply & Restart。这两个地址实测可用；
+#     ustc（docker.mirrors.ustc.edu.cn）和 163（hub-mirror.c.163.com）都已失效。
+#
+#  ============================================================
+#  【为什么 MySQL 要占 3307 而不是 3306？】
+#  ============================================================
+#  因为这台机器上**已经装了 MySQL 8.0 并占着 3306**。
+#  容器的端口映射写成 "3307:3306" 的意思是：
+#      宿主机 3307  →  容器内的 3306
+#  于是本地 MySQL 和容器 MySQL 能同时跑，互不打架。
+#
+#  这也是端口映射这个概念的典型用途 —— 冒号左边是「外面看到的」，
+#  右边是「容器里那个程序真正监听的」。程序永远只管自己容器内的端口，
+#  外面怎么进来由你决定。
+#
+#  代价：连容器里的库要写 3307。开发时用哪个由 application-dev.properties
+#  里的地址决定，默认连的是本机 3306 那个。
+# ============================================================
+
+services:
+
+  mysql:
+    image: mysql:8.0
+    container_name: mall-mysql
+    restart: unless-stopped
+    ports:
+      - "3307:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: shop
+      # 【这一行不写会怎样？】
+      # 容器默认时区是 UTC。MySQL 的 time_zone 默认值是 SYSTEM（跟随系统），
+      # 于是 NOW() 比北京时间慢 8 小时。
+      # 表现：订单创建时间是「8 小时前」，超时关单的逻辑会立刻把刚下的单关掉。
+      # 这种 bug 不报错、只是数据不对，最难查。
+      TZ: Asia/Shanghai
+    command:
+      # 再在 MySQL 层面显式钉一次时区，不依赖它去猜系统时区。
+      # 和上面的 TZ 是两层：TZ 管容器的操作系统，这行管 MySQL 自己。
+      - --default-time-zone=+08:00
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      # ① 数据卷：MySQL 的数据目录。
+      #    【为什么必须挂？】不挂的话，数据写在容器可写层里，
+      #    容器一删（docker compose down）数据就跟着没了。
+      #    挂到命名卷上，容器只是「使用」这块数据，删容器不动数据。
+      - mysql-data:/var/lib/mysql
+      # ② 初始化脚本：容器**第一次**启动时，会把这里的 .sql 全跑一遍。
+      #    ⚠️ 只在数据目录为空时执行。之后你改了 sql/schema.sql，
+      #    再 up 也不会重跑 —— 因为数据卷已经不为空了。
+      #    想让它重跑：docker compose down -v 把卷删掉，再 up。
+      #    不知道这条的人会一直以为是 SQL 写错了。
+      #    :ro 是只读挂载，防止容器改你的源文件。
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # 【healthcheck 是干什么的？】
+      # 它让 docker 定期问「这个容器真的可用了吗」。
+      # 光看容器「running」是不够的 —— MySQL 启动要几十秒，
+      # 这期间进程活着但连不上。有了它，depends_on + condition
+      # 才能做到「等 MySQL 真就绪了再启动依赖它的服务」。
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      # 头 30 秒不算失败 —— 首次启动要初始化数据目录，本来就慢
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    container_name: mall-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command:
+      # 【--appendonly yes 是什么？】
+      # Redis 默认是纯内存 + 快照持久化（RDB），宕机可能丢最近几分钟的数据。
+      # AOF 会把每条写命令追加到文件，重启时重放，丢得少得多。
+      # 代价是文件更大、写入稍慢。
+      #
+      # 【为什么这个选择在本项目里重要？】
+      # 因为后面要用 Redis 缓存商品数据、还要放 token。
+      # 缓存丢了可以重建（回源查库），但 token 丢了 = 所有人被登出。
+      # 所以这里开 AOF，是为了 token 那一类「丢了有后果」的数据。
+      - --appendonly
+      - "yes"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  rabbitmq:
+    # ⚠️ 这个 tag 是三个镜像里唯一**没能实测验证**的 ——
+    #    本机 Docker Hub 被 DNS 污染，查不到 tag 列表。
+    #    mysql:8.0 和 redis:7-alpine 是长期稳定 tag，风险很低；
+    #    rabbitmq 的 4.x 相对新，所以留个兜底：
+    #    如果 pull 时报 "manifest unknown"，把下面这行换成
+    #        image: rabbitmq:3-management-alpine
+    #    功能完全够用，不影响超时关单的任何内容。
+    image: rabbitmq:4-management-alpine
+    container_name: mall-rabbitmq
+    restart: unless-stopped
+    ports:
+      # 5672  = 程序连的端口（AMQP 协议），Spring Boot 连这个
+      # 15672 = 网页管理台，浏览器开 http://localhost:15672 看队列积压
+      # 【15672 这个管理台是本项目必用的】——
+      # 做超时关单时，你要靠它确认：消息进没进队列、有没有进死信队列、
+      # 积压了多少条。没有它就只能靠猜。
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+# ============================================================
+#  命名卷 —— 这些卷的实际文件在 Docker 管理的目录里，不在项目目录下。
+#  想彻底重置某个中间件：docker compose down -v
+# ============================================================
+volumes:
+  mysql-data:
+  redis-data:
+  rabbitmq-data:
+
+# ============================================================
+#  【为什么这里没有 mall 应用自己的服务？】
+#  因为开发时应用在 IDE / mvn 里跑（改代码能热重启），
+#  放进容器反而每次改代码都要重新打镜像，开发体验差。
+#
+#  容器化应用自己（写 Dockerfile）是「能一键起完整环境」的加分项，
+#  排在收尾阶段，不影响主链路。到时再加。
+# ============================================================
